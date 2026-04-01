@@ -14,6 +14,8 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/preferences.h"
+#include "esphome/core/string_ref.h"
+#include "esphome/core/version.h"
 #include "esphome/components/uart/uart.h"
 #include "esphome/components/api/custom_api_device.h"
 
@@ -40,6 +42,7 @@
 #include "types.h"
 #include "helpers.h"
 #include "page_base.h"
+#include "page_manager.h"
 #include "card_base.h"
 #include "pages.h"
 
@@ -59,40 +62,46 @@ public:
 
   std::shared_ptr<Entity> create_entity(const std::string &entity_id);
 
-  template <class TPage, class... TArgs>
-  TPage* create_page(TArgs&&... args) {
-    return this->insert_page<TPage>(SIZE_MAX, std::forward<TArgs>(args)...);
+  template <class... TArgs>
+  Screensaver* create_screensaver(TArgs&&... args) {
+    if (this->screensaver_ == nullptr) {
+      this->screensaver_ = this->page_mgr_
+        .find_bookmarked_page<Screensaver>((uint8_t)render_page_option::screensaver_page);
+      if (this->screensaver_ != nullptr)
+        return this->screensaver_;
+    }
+    this->screensaver_ = this->page_mgr_
+      .insert_page<Screensaver>(0, std::forward<TArgs>(args)...);
+    // Ensure the page is skipped when cycling the pages
+    this->screensaver_->set_hidden(true);
+    this->screensaver_->set_on_item_added_callback(
+      std::bind(&NSPanelLovelace::on_page_item_added_callback,
+        this, std::placeholders::_1));
+    return this->screensaver_;
   }
 
-  template <class TPage, class... TArgs>
-  TPage* insert_page(const size_t position, TArgs&&... args) {
+  template <typename TPage, typename... TArgs>
+  TPage* create_page(TArgs&&... args) {
     static_assert(
       std::is_base_of<Page, TPage>::value,
       "TPage must derive from esphome::nspanel_lovelace::Page");
-    std::shared_ptr<TPage> page = std::make_shared<TPage>(std::forward<TArgs>(args)...);
-    // allows us to listen to item added events from pages
-    page->set_on_item_added_callback(
+    TPage* page = this->page_mgr_.create_page<TPage>(std::forward<TArgs>(args)...);
+    static_cast<Page*>(page)->set_on_item_added_callback(
       std::bind(&NSPanelLovelace::on_page_item_added_callback,
         this, std::placeholders::_1));
-    
-    if (position == SIZE_MAX || position >= this->pages_.size())
-        this->pages_.push_back(page);
-    else
-      this->pages_.insert(this->pages_.begin() + position, page);
-
-    // set the screensaver if the page is a screensaver page
-    // todo: refactor so this isn't required here
-    if (page->is_type(page_type::screensaver)) {
-      this->screensaver_ = page_cast<Screensaver>(page.get());
-    }
-
-    return page.get();
+    return page;
   }
 
 #ifdef USE_TIME
   void set_time_id(time::RealTimeClock *time_id) { this->time_id_ = time_id; }
-  void set_date_format(const std::string &date_format) { this->date_format_ = date_format; }
-  void set_time_format(const std::string &time_format) { this->time_format_ = time_format; }
+  void set_date_format(const std::string &date_format) {
+    if (date_format.empty()) return;
+    this->date_format_ = date_format;
+  }
+  void set_time_format(const std::string &time_format) {
+    if (time_format.empty()) return;
+    this->time_format_ = time_format;
+  }
 
   void update_date(const char *date_format = "") { this->update_datetime(datetime_mode::date, date_format); }
   void update_time(const char *time_format = "") { this->update_datetime(datetime_mode::time, "", time_format); }
@@ -102,17 +111,31 @@ public:
   
   void on_page_item_added_callback(const std::shared_ptr<PageItem> &item);
   void set_language(const std::string &language) { this->language_ = language; }
+  // Note: This can only be called after the requested page has been created.
+  //       Returns true if sucessful, otherwise false.
+  bool set_default_page(const std::string &uuid) {
+    auto index = this->page_mgr_.find_page_index(uuid);
+    if (index == SIZE_MAX) return false;
+    return this->page_mgr_.bookmark_page(
+      (uint8_t)render_page_option::default_page, index, true);
+  }
   void set_display_timeout(uint16_t timeout);
   void set_display_active_dim(uint8_t active);
   void set_display_inactive_dim(uint8_t inactive);
   // Note: this can be used without parameters to update the display without changing the levels
   void set_display_dim(uint8_t inactive = UINT8_MAX, uint8_t active = UINT8_MAX);
+#ifdef USE_NSPANEL_WEATHER_SERVICE
+  void set_weather_forecast_data(std::string forecast_json);
+#endif
   void set_weather_entity_id(const std::string &weather_entity_id) { this->weather_entity_id_ = weather_entity_id; }
 
-  void render_screensaver() { this->render_page_(render_page_option::screensaver); }
+  bool get_double_tap_to_unlock() const { return this->double_tap_to_unlock_; }
+  void set_double_tap_to_unlock(bool value) { this->double_tap_to_unlock_ = value; }
+  
+  void render_screensaver_page() { this->render_page_(render_page_option::screensaver_page); }
   void render_next_page() { this->render_page_(render_page_option::next); }
   void render_previous_page() { this->render_page_(render_page_option::prev); }
-  void render_first_page() { this->render_page_(render_page_option::default_page); }
+  void render_default_page() { this->render_page_(render_page_option::default_page); }
 
   void notify_on_screensaver(const std::string &heading,
       const std::string &message, uint32_t timeout_ms = 0);
@@ -168,15 +191,19 @@ protected:
   void send_nextion_command_(const std::string &command);
 
   void subscribe_homeassistant_state_attr(
-      void (NSPanelLovelace::*callback)(std::string, std::string, std::string),
-      std::string entity_id, std::string attribute) {
-    auto f = std::bind(callback, this, entity_id, attribute, std::placeholders::_1);
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026,1,0)
+    void (NSPanelLovelace::*callback)(const std::string &, const std::string &, esphome::StringRef),
+#else
+    void (NSPanelLovelace::*callback)(std::string, std::string, std::string),
+#endif
+    const std::string &entity_id, const std::string &attr_name
+  ) {
+    auto f = std::bind(callback, this, entity_id, attr_name, std::placeholders::_1);
     api::global_api_server->
-      subscribe_home_assistant_state(entity_id, optional<std::string>(attribute), f);
+      subscribe_home_assistant_state(entity_id, optional<std::string>(attr_name), std::move(f));
   }
 
   bool process_data_();
-  size_t find_page_index_by_uuid_(const std::string &uuid) const;
   const std::string &try_replace_uuid_with_entity_id_(const std::string &uuid_or_entity_id);
   void process_command_(const std::string &message);
   void send_buffered_command_();
@@ -187,9 +214,10 @@ protected:
   StatefulPageItem* get_page_item_(const std::string &uuid);
   Entity* get_entity_(const std::string &entity_id);
 
-  void render_page_(size_t index);
+  void render_page_(const std::string &uuid);
   void render_page_(render_page_option d);
   void render_current_page_();
+  void render_item_update_();
   void render_item_update_(Page *page);
   void render_popup_notify_page_(const std::string &internal_id,
     const std::string &heading, const std::string &message, uint16_t timeout = 0U,
@@ -210,10 +238,13 @@ protected:
   // Check and update clock if required
   void check_time_();
   optional<time::RealTimeClock *> time_id_{};
-  std::string date_format_, time_format_;
+  std::string date_format_ = "%A, %d. %B %Y";
+  std::string time_format_ = "%H:%M";
   uint8_t now_minute_, now_hour_;
   bool time_configured_;
 #endif
+  
+  bool double_tap_to_unlock_ = false;
 
   uint8_t display_active_dim_ = 100;
   uint8_t display_inactive_dim_ = 50;
@@ -230,6 +261,16 @@ protected:
     const std::string& service,
     const std::map<std::string, std::string> &data,
     const std::map<std::string, std::string> &data_template = {});
+#if ESPHOME_VERSION_CODE >= VERSION_CODE(2026,1,0)
+  void on_entity_state_update_(const std::string &entity_id, esphome::StringRef state);
+  void on_entity_attribute_update_(
+    const std::string &entity_id, const std::string &attr_name, esphome::StringRef attr_value);
+
+  void on_weather_state_update_(const std::string &entity_id, esphome::StringRef state);
+  void on_weather_temperature_update_(const std::string &entity_id, esphome::StringRef temperature);
+  void on_weather_temperature_unit_update_(const std::string &entity_id, esphome::StringRef temperature_unit);
+  void on_weather_forecast_update_(const std::string &entity_id, esphome::StringRef forecast_json);
+#else
   void on_entity_state_update_(std::string entity_id, std::string state);
   void on_entity_attribute_update_(
     std::string entity_id, std::string attr_name, std::string attr_value);
@@ -238,6 +279,7 @@ protected:
   void on_weather_temperature_update_(std::string entity_id, std::string temperature);
   void on_weather_temperature_unit_update_(std::string entity_id, std::string temperature_unit);
   void on_weather_forecast_update_(std::string entity_id, std::string forecast_json);
+#endif
   void send_weather_update_command_();
   std::string weather_entity_id_;
   std::string language_;
@@ -250,14 +292,12 @@ protected:
   std::string button_press_type_;
   std::string button_press_value_;
 
-  uint8_t current_page_index_ = 0;
+  PageManager page_mgr_;
   std::string popup_page_current_uuid_;
-  Page* current_page_ = nullptr;
   bool force_current_page_update_ = false;
-  Screensaver* screensaver_ = nullptr;
   std::vector<std::shared_ptr<Entity>> entities_;
-  std::vector<std::shared_ptr<Page>> pages_;
   std::vector<std::shared_ptr<StatefulPageItem>> stateful_page_items_;
+  Screensaver* screensaver_ = nullptr;
   StatefulPageItem* cached_page_item_ = nullptr;
   Entity* cached_entity_ = nullptr;
 

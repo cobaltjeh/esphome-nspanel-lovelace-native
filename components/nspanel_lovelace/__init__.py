@@ -10,6 +10,7 @@ import os, json
 
 from esphome.components import uart, time, esp32
 from esphome.const import (
+    __version__ as ESPHOME_VERSION,
     CONF_ID,
     CONF_TRIGGER_ID,
     CONF_TIME_ID,
@@ -19,6 +20,7 @@ from esphome.const import (
 
 CODEOWNERS = ["@olicooper"]
 DEPENDENCIES = ["uart", "time", "wifi", "api", "esp32", "json"]
+CONFLICTS_WITH = ["psram"]
 
 def AUTO_LOAD():
     val = ["text_sensor", "json"]
@@ -26,6 +28,7 @@ def AUTO_LOAD():
 
 _LOGGER = logging.getLogger(__name__)
 
+card_ids: dict[str] = {}
 entity_ids: dict[str] = {}
 entity_id_index = 0
 uuid_index = 0
@@ -117,6 +120,7 @@ CONF_ICON_VALUE = "value"
 CONF_ICON_COLOR = "color"
 CONF_ENTITY_ID = "entity_id"
 CONF_SLEEP_TIMEOUT = "sleep_timeout"
+CONF_DEFAULT_CARD = "default_card"
 
 CONF_LOCALE = "locale"
 CONF_TEMPERATURE_UNIT = "temperature_unit"
@@ -130,12 +134,13 @@ CONF_SCREENSAVER_WEATHER = "weather"
 CONF_SCREENSAVER_STATUS_ICON_LEFT = "status_icon_left"
 CONF_SCREENSAVER_STATUS_ICON_RIGHT = "status_icon_right"
 CONF_SCREENSAVER_STATUS_ICON_ALT_FONT = "alt_font" # todo: to_code
+CONF_SCREENSAVER_DOUBLE_TAP_TO_UNLOCK = "double_tap_to_unlock"
+CONF_SCREENSAVER_FORECAST_METHOD = "forecast_method"
 
 CONF_CARDS = "cards"
 CONF_CARD_TYPE = "type"
 CONF_CARD_HIDDEN = "hidden"
 CONF_CARD_TITLE = "title"
-CONF_CARD_SLEEP_TIMEOUT = "sleep_timeout"
 CONF_CARD_ENTITIES = "entities"
 CONF_CARD_ENTITIES_NAME = "name"
 
@@ -331,8 +336,10 @@ SCHEMA_SCREENSAVER = cv.Schema({
     cv.Optional(CONF_TIME_ID): cv.use_id(time.RealTimeClock),
     cv.Optional(CONF_SCREENSAVER_DATE_FORMAT, default="%A, %d. %B %Y"): valid_clock_format('Date format'),
     cv.Optional(CONF_SCREENSAVER_TIME_FORMAT, default="%H:%M"): valid_clock_format('Time format'),
+    cv.Optional(CONF_SCREENSAVER_DOUBLE_TAP_TO_UNLOCK, default=False): cv.boolean,
     cv.Optional(CONF_SCREENSAVER_WEATHER): cv.Schema({
-        cv.Required(CONF_ENTITY_ID): valid_entity_id()
+        cv.Required(CONF_ENTITY_ID): valid_entity_id(),
+        cv.Optional(CONF_SCREENSAVER_FORECAST_METHOD, default="template_sensor"): cv.one_of("template_sensor", "service"),
     }),
     cv.Optional(CONF_SCREENSAVER_STATUS_ICON_LEFT): SCHEMA_STATUS_ICON,
     cv.Optional(CONF_SCREENSAVER_STATUS_ICON_RIGHT): SCHEMA_STATUS_ICON,
@@ -348,13 +355,14 @@ SCHEMA_CARD_BASE = cv.Schema({
     cv.Optional(CONF_ID): valid_uuid,
     cv.Optional(CONF_CARD_TITLE): cv.string,
     cv.Optional(CONF_CARD_HIDDEN, default=False): cv.boolean,
-    # timeout range from 0s to 12hr. 0s means disable screensaver
-    cv.Optional(CONF_CARD_SLEEP_TIMEOUT, default=10): cv.int_range(0, 43200)
+    # Timeout range from 0s to 65s. 0s means disable screensaver.
+    # note: Max is limited by HMI firmware: https://github.com/joBr99/nspanel-lovelace-ui/blob/22e96f2b3ad0cd3382008eac9b4d6a27982404b8/HMI/README.md?plain=1#L91
+    cv.Optional(CONF_SLEEP_TIMEOUT, default=10): cv.int_range(0, 120)
 })
 
 def add_entity_id(id: str):
     global entity_ids, entity_id_index
-    if (entity_ids.get(id, None) is None):
+    if (entity_ids.get(id) is None):
         entity_ids[id] = f"nspanel_e{entity_id_index}"
         entity_id_index += 1
 
@@ -372,18 +380,29 @@ def get_card_entities_length_limits(card_type: str, model: str = 'eu') -> list[i
     return [0,0]
 
 def validate_config(config):
+    global card_ids
     model = config[CONF_MODEL]
     if CONF_LANGUAGE not in config[CONF_LOCALE]:
         raise cv.Invalid("A language must be specified in locale")
     # Build a list of custom card ids
-    card_ids = []
-    for card_config in config.get(CONF_CARDS, []):
+    for i, card_config in enumerate(config.get(CONF_CARDS, [])):
         if CONF_ID in card_config:
-            card_ids.append(card_config[CONF_ID])
+            card_ids[card_config[CONF_ID]] = i
+
+    if CONF_DEFAULT_CARD in config and card_ids.get(config[CONF_DEFAULT_CARD]) is None:
+        raise cv.Invalid(f"Cannot find a card with the id '{config[CONF_DEFAULT_CARD]}'", [CONF_DEFAULT_CARD])
 
     for i, card_config in enumerate(config.get(CONF_CARDS, [])):
+        err_path = [CONF_CARDS, i]
+
+        if i == 0 and CONF_SCREENSAVER not in config:
+            if card_config[CONF_CARD_HIDDEN] == True:
+                raise cv.Invalid(f"The first card cannot be hidden if the screensaver is disabled", err_path)
+            if card_config[CONF_SLEEP_TIMEOUT] != 0:
+                raise cv.Invalid(f"The first card sleep_timeout must be 0 if the screensaver is disabled", err_path)
+
         entities = card_config.get(CONF_CARD_ENTITIES, [])
-        err_path = [CONF_CARDS, i, CONF_CARD_ENTITIES]
+        err_path.append(CONF_CARD_ENTITIES)
 
         length_limits = get_card_entities_length_limits(card_config[CONF_CARD_TYPE], model)
         if len(entities) > 0 and length_limits[1] == 0:
@@ -401,7 +420,7 @@ def validate_config(config):
                 entity_arr = entity_id.split('.', 1)
                 # if len(entity_arr) != 2:
                 #     raise cv.Invalid(f'The entity_id "{entity_id}" format is invalid')
-                if entity_arr[1] not in card_ids:
+                if card_ids.get(entity_arr[1]) is None:
                     raise cv.Invalid(f'navigation entity_id invalid, no card has the id "{entity_arr[1]}"', err_path)
             # Add all valid HA entities to global entity list for later processing
             # if not (entity_id.startswith('iText') or entity_id.startswith('delete')):
@@ -428,10 +447,12 @@ def validate_config(config):
 CONFIG_SCHEMA = cv.All(
     cv.Schema({
         cv.GenerateID(): cv.declare_id(NSPanelLovelace),
-        cv.Optional(CONF_SLEEP_TIMEOUT, default=10): cv.int_range(0, 43200),
+        # Timeout range from 0s to 65s. 0s means disable screensaver.
+        cv.Optional(CONF_SLEEP_TIMEOUT, default=10): cv.int_range(0, 65),
         cv.Optional(CONF_MODEL, default='eu'): cv.one_of('eu', 'us-l', 'us-p'),
+        cv.Optional(CONF_DEFAULT_CARD): cv.string_strict,
         cv.Optional(CONF_LOCALE, default={}): SCHEMA_LOCALE,
-        cv.Optional(CONF_SCREENSAVER, default={}): SCHEMA_SCREENSAVER,
+        cv.Optional(CONF_SCREENSAVER): SCHEMA_SCREENSAVER,
         cv.Optional(CONF_INCOMING_MSG): automation.validate_automation(
             cv.Schema({
                 cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(NSPanelLovelaceMsgIncomingTrigger),
@@ -476,6 +497,7 @@ CONFIG_SCHEMA = cv.All(
     .extend(uart.UART_DEVICE_SCHEMA)
     .extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
+    cv.require_esphome_version(2025,8,0),
     #cv.only_with_esp_idf,
     validate_config
 )
@@ -610,11 +632,25 @@ async def to_code(config):
         esp32.add_idf_sdkconfig_option("CONFIG_D0WD_PSRAM_CLK_IO", 5)
         esp32.add_idf_sdkconfig_option("CONFIG_D0WD_PSRAM_CS_IO", 18)
         # Also increase flash & CPU speed as NSPanel hardware supports it
-        esp32.add_idf_sdkconfig_option("CONFIG_ESP32_DEFAULT_CPU_FREQ_240", True)
+        esp32.add_idf_sdkconfig_option("CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240", True)
         esp32.add_idf_sdkconfig_option("CONFIG_SPIRAM_SPEED_80M", True)
         esp32.add_idf_sdkconfig_option("CONFIG_SPIRAM_MODE_QUAD", True)
         esp32.add_idf_sdkconfig_option("CONFIG_ESPTOOLPY_FLASHMODE_QIO", True)
         esp32.add_idf_sdkconfig_option("CONFIG_ESPTOOLPY_FLASHFREQ_80M", True)
+
+        # Enable use of bluetooth_proxy by moving memory allocations to PSRAM
+        # see: https://esphome.io/components/bluetooth_proxy
+        esp32.add_idf_sdkconfig_option("CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST", True)
+        esp32.add_idf_sdkconfig_option("CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY", True)
+
+        ## Allow handling of large weather forecast objects
+        cg.add_define("ARDUINOJSON_SLOT_ID_SIZE", 2)
+        cg.add_define("ARDUINOJSON_ENABLE_STD_STRING", 1)
+
+    ## Explicitly enable services and states in ESPHome v2025.8.0+
+    if cv.Version.parse(ESPHOME_VERSION) >= cv.Version(2025,8,0):
+        cg.add_define("USE_API_HOMEASSISTANT_STATES")
+        cg.add_define("USE_API_HOMEASSISTANT_SERVICES")
 
     nspanel = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(nspanel, config)
@@ -638,12 +674,15 @@ async def to_code(config):
             cg.add_library("WiFiClientSecure", None)
             cg.add_library("HTTPClient", None)
         elif core.CORE.using_esp_idf:
+            ## todo: Remove this condition by esphome version 2026.6.x
+            if hasattr(esp32, "include_builtin_idf_component"):
+                esp32.include_builtin_idf_component("esp_http_client")
             esp32.add_idf_sdkconfig_option("CONFIG_ESP_TLS_INSECURE", True)
             esp32.add_idf_sdkconfig_option(
                 "CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY", True
             )
 
-    if CONF_SLEEP_TIMEOUT in config:
+    if CONF_SCREENSAVER in config:
         cg.add(nspanel.set_display_timeout(config[CONF_SLEEP_TIMEOUT]))
 
     locale_config = config[CONF_LOCALE]
@@ -680,7 +719,9 @@ async def to_code(config):
 
     screensaver_config = config.get(CONF_SCREENSAVER, None)
     screensaver_uuid = None
-    if screensaver_config is not None:
+    if screensaver_config is None:
+        cg.add(nspanel.set_display_timeout(0))
+    else:
         cg.add(cg.RawStatement("{"))
 
         screensaver_uuid = screensaver_config[CONF_ID] if CONF_ID in screensaver_config else get_new_uuid()
@@ -694,13 +735,16 @@ async def to_code(config):
         if CONF_SCREENSAVER_TIME_FORMAT in screensaver_config:
             cg.add(nspanel.set_time_format(screensaver_config[CONF_SCREENSAVER_TIME_FORMAT]))
 
+        if screensaver_config.get(CONF_SCREENSAVER_DOUBLE_TAP_TO_UNLOCK, False):
+            cg.add(nspanel.set_double_tap_to_unlock(True))
+
         screensaver_info = PAGE_MAP[CONF_SCREENSAVER]
         screensaver_class = cg.global_ns.class_(screensaver_info[0])
         screensaver_class.op = "->"
 
         cg.add(cg.RawExpression(
             f"auto {screensaver_info[0]} = "
-            f"{nspanel.insert_page.template(screensaver_info[1]).__call__(0, screensaver_uuid)}"))
+            f"{nspanel.create_screensaver.__call__(screensaver_uuid)}"))
 
         if CONF_SCREENSAVER_STATUS_ICON_LEFT in screensaver_config:
             left_icon_config = screensaver_config[CONF_SCREENSAVER_STATUS_ICON_LEFT]
@@ -729,8 +773,18 @@ async def to_code(config):
             cg.add(screensaver_class.set_icon_right(iconright_variable_class))
 
         if CONF_SCREENSAVER_WEATHER in screensaver_config:
-            entity_id = screensaver_config[CONF_SCREENSAVER_WEATHER][CONF_ENTITY_ID]
-            cg.add(nspanel.set_weather_entity_id(entity_id))
+            weather_config = screensaver_config[CONF_SCREENSAVER_WEATHER]
+            if CONF_ENTITY_ID in weather_config:
+                cg.add(nspanel.set_weather_entity_id(weather_config[CONF_ENTITY_ID]))
+            if CONF_SCREENSAVER_FORECAST_METHOD in weather_config:
+                if weather_config[CONF_SCREENSAVER_FORECAST_METHOD] == "service":
+                    cg.add_define("USE_API_CUSTOM_SERVICES")
+                    cg.add_define("USE_NSPANEL_WEATHER_SERVICE")
+                else:
+                    _LOGGER.warning(
+                        "forecast_method 'template_sensor' is deprecated and will be removed in esphome 2026.6. "
+                        "Please use forecast_method 'service' instead (see the README for the required HA automation template)."
+                    )
             screensaver_items = []
             # 1 main weather item + 4 forecast items
             for i in range(0,5):
@@ -780,7 +834,12 @@ async def to_code(config):
         # else:
         #     card_class = cg.new_Pvariable(card_variable)
 
-        sleep_timeout = card_config.get(CONF_CARD_SLEEP_TIMEOUT, 10)
+        if i == 0 and CONF_SCREENSAVER not in config:
+            # Note: If the default (first) card has a timeout, then it will keep rendering 
+            #       every time the 'sleepReached' event is sent from the display, so we set it to 0 here instead.
+            sleep_timeout = 0
+        else:
+            sleep_timeout = card_config.get(CONF_SLEEP_TIMEOUT, 10)
         # if isinstance(sleep_timeout, int):
         #     cg.add(card_class.set_sleep_timeout(sleep_timeout))
         #     cg.add(cg.RawExpression(f"{card_variable}->set_sleep_timeout({sleep_timeout})"))
@@ -849,6 +908,13 @@ async def to_code(config):
             page_info[3])
 
         cg.add(cg.RawStatement("}"))
+
+    if CONF_DEFAULT_CARD in config:
+        # index = card_ids.get(config[CONF_DEFAULT_CARD])
+        # if isinstance(index, int):
+        if config[CONF_DEFAULT_CARD] in card_ids:
+            # Note: can only be called after all the default page has been created
+            cg.add(nspanel.set_default_page(config[CONF_DEFAULT_CARD]))
 
     global custom_icons
     icon_arr: list[str] = []
